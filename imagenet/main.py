@@ -515,7 +515,6 @@ def load_checkpoint(
         state.load(checkpoint_file, device_id)
         print(f"=> loaded checkpoint file: {checkpoint_file}")
         print(f"=> epoch: {state.epoch}")
-        return state
 
     # logic below is unnecessary when the checkpoint is visible on all nodes!
     # create a temporary cpu pg to broadcast most up-to-date checkpoint
