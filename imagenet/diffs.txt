@@ -2,3 +2,6 @@
 2. --batch_size: now specifies per_rank_batch_size
 3. --workers: specifies num_dataloaders exactly, defaults to 0
 4. removed rank, gpu, multiprocessing-distributed, dist_url since these are obsolete with torchrun elastic launch
+5. added more determinism code
+6. ported over state class from elastic example, and its checkpointing logic
+7. added rng checkpointing logic
