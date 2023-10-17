@@ -63,6 +63,8 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
 parser.add_argument("--checkpoint-file", default="/tmp/checkpoint.pth.tar", type=str, help="checkpoint file path, to load and save to")
+parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="This gets overridden after an elastic scale up/down")
+parser.add_argument("--max-steps", type=int, default=None, help="Number of steps to run training for")
 
 best_acc1 = 0
 
@@ -191,15 +193,21 @@ def main_worker(gpu, args):
         for _ in train_loader:
             break
     
+    optimizer.zero_grad()
+
     if os.path.isfile(args.checkpoint_file):
         state.load_rng_state(args.checkpoint_file)
 
     for epoch in range(start_epoch, args.epochs):
+        if args.max_steps is not None and state.global_step >= args.max_steps:
+            print(f"=> Finished processing {args.max_steps} iterations")
+            break
+        
         state.epoch = epoch
         train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, state, args)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
@@ -210,11 +218,11 @@ def main_worker(gpu, args):
         is_best = acc1 > state.best_acc1
         state.best_acc1 = max(acc1, state.best_acc1)
 
-        if gpu == 0:
+        if args.gpu == 0:
             save_checkpoint(state, is_best, args.checkpoint_file)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, state, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -241,6 +249,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         output = model(images)
         loss = criterion(output, target)
 
+        loss = loss / args.gradient_accumulation_steps
+
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images.size(0))
@@ -248,9 +258,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+
+        if ((i + 1) % args.gradient_accumulation_steps == 0) or (i + 1 == len(train_loader)):
+            optimizer.step()
+            optimizer.zero_grad()
+            state.global_step += 1
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -258,6 +271,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
+
+        if args.max_steps is not None and state.global_step == args.max_steps:
+            break
 
 
 def validate(val_loader, model, criterion, args):
@@ -422,6 +438,7 @@ class State:
 
     def __init__(self, arch, model, optimizer, scheduler):
         self.epoch = -1
+        self.global_step = 0
         self.best_acc1 = 0
         self.arch = arch
         self.model = model
@@ -441,6 +458,7 @@ class State:
         """
         return {
             "epoch": self.epoch,
+            "global_step": self.global_step,
             "best_acc1": self.best_acc1,
             "arch": self.arch,
             "state_dict": self.model.state_dict(),
@@ -462,6 +480,7 @@ class State:
         """
 
         self.epoch = obj["epoch"]
+        self.global_step = obj["global_step"]
         self.best_acc1 = obj["best_acc1"]
         self.state_dict = obj["state_dict"]
         self.model.load_state_dict(obj["state_dict"])
