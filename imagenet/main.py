@@ -65,6 +65,7 @@ parser.add_argument('--dummy', action='store_true', help="use fake data to bench
 parser.add_argument("--checkpoint-file", default="/tmp/checkpoint.pth.tar", type=str, help="checkpoint file path, to load and save to")
 parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="This gets overridden after an elastic scale up/down")
 parser.add_argument("--max-steps", type=int, default=None, help="Number of steps to run training for")
+parser.add_argument("--save-steps", type=int, default=None, help="Number of training steps to complete before taking a checkpoint")
 
 best_acc1 = 0
 
@@ -181,12 +182,24 @@ def main_worker(gpu, args):
         args.checkpoint_file, args.gpu, args.arch, model, optimizer, scheduler
     )
 
+    if state.prev_batch_index == -1:
+        start_epoch = state.epoch + 1
+        iters_to_skip = 0
+    else:
+        start_epoch = state.epoch
+        # Constaint: Prev world size and current world size are divisible, not explicitly enforcing however
+        iters_to_skip = int(state.prev_batch_index * (state.prev_world_size / args.world_size)) + 1
+
+    print(f"=> Starting from epoch: {start_epoch}, skipping iters={iters_to_skip}")
+    # Update GAS if necessary to ensure agg batch size is fixed
+    args.gradient_accumulation_steps *= (state.prev_world_size / args.world_size)
+    print(f"=> Using GAS = {args.gradient_accumulation_steps}")
+    # Update state
+    state.prev_world_size = args.world_size
+
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
-
-    start_epoch = state.epoch + 1
-    print(f"=> start_epoch: {start_epoch}, best_acc1: {state.best_acc1}")
 
     for epoch in range(start_epoch):
         # Create the randomization of the sampler
@@ -195,8 +208,7 @@ def main_worker(gpu, args):
     
     optimizer.zero_grad()
 
-    if os.path.isfile(args.checkpoint_file):
-        state.load_rng_state(args.checkpoint_file)
+    state.load_rng_state(args.checkpoint_file)
 
     for epoch in range(start_epoch, args.epochs):
         if args.max_steps is not None and state.global_step >= args.max_steps:
@@ -207,7 +219,10 @@ def main_worker(gpu, args):
         train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, state, args)
+        train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip, args)
+
+        if epoch == start_epoch:
+            iters_to_skip = 0
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
@@ -218,11 +233,13 @@ def main_worker(gpu, args):
         is_best = acc1 > state.best_acc1
         state.best_acc1 = max(acc1, state.best_acc1)
 
+        # Take an epoch level checkpoint as well
         if args.gpu == 0:
+            state.prev_batch_index = -1
             save_checkpoint(state, is_best, args.checkpoint_file)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, state, args):
+def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -241,6 +258,15 @@ def train(train_loader, model, criterion, optimizer, epoch, state, args):
         # measure data loading time
         data_time.update(time.time() - end)
 
+        if iters_to_skip > 0:
+            iters_to_skip -= 1
+            batch_time.update(time.time() - end)
+            end = time.time()
+            if iters_to_skip == 0:
+                state.load_rng_state(args.checkpoint_file)
+            continue
+
+        step_taken = False
         # move data to the same device as model
         images = images.cuda(args.gpu, non_blocking=True)
         target = target.cuda(args.gpu, non_blocking=True)
@@ -254,6 +280,8 @@ def train(train_loader, model, criterion, optimizer, epoch, state, args):
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images.size(0))
+        # If we want accurate top1 top5 reporting after restore
+        # of iteration level checkpoint, we need to freeze these objects as well
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
@@ -264,6 +292,7 @@ def train(train_loader, model, criterion, optimizer, epoch, state, args):
             optimizer.step()
             optimizer.zero_grad()
             state.global_step += 1
+            step_taken = True
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -271,6 +300,11 @@ def train(train_loader, model, criterion, optimizer, epoch, state, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
+
+        if args.save_steps is not None and step_taken and state.global_step % args.save_steps == 0:
+            if args.gpu == 0:
+                state.prev_batch_index = i
+                save_checkpoint(state, False, args.checkpoint_file)
 
         if args.max_steps is not None and state.global_step == args.max_steps:
             break
@@ -439,6 +473,8 @@ class State:
     def __init__(self, arch, model, optimizer, scheduler):
         self.epoch = -1
         self.global_step = 0
+        self.prev_world_size = 1
+        self.prev_batch_index = -1
         self.best_acc1 = 0
         self.arch = arch
         self.model = model
@@ -459,6 +495,8 @@ class State:
         return {
             "epoch": self.epoch,
             "global_step": self.global_step,
+            "prev_world_size": self.prev_world_size,
+            "prev_batch_index": self.prev_batch_index,
             "best_acc1": self.best_acc1,
             "arch": self.arch,
             "state_dict": self.model.state_dict(),
@@ -481,6 +519,8 @@ class State:
 
         self.epoch = obj["epoch"]
         self.global_step = obj["global_step"]
+        self.prev_world_size = obj["prev_world_size"]
+        self.prev_batch_index = obj["prev_batch_index"]
         self.best_acc1 = obj["best_acc1"]
         self.state_dict = obj["state_dict"]
         self.model.load_state_dict(obj["state_dict"])
@@ -497,12 +537,13 @@ class State:
         self.apply_snapshot(snapshot, device_id)
 
     def load_rng_state(self, f):
-        # Rng state needs to be loaded onto the cpu, so we cant reuse the snapshot from before
-        snapshot = torch.load(f)
-        random.setstate(snapshot["rng_state"]["python"])
-        numpy.random.set_state(snapshot["rng_state"]["numpy"])
-        torch.random.set_rng_state(snapshot["rng_state"]["cpu"])
-        torch.cuda.random.set_rng_state(snapshot["rng_state"]["cuda"])
+        if os.path.isfile(f):
+            # Rng state needs to be loaded onto the cpu, so we cant reuse the snapshot from before
+            snapshot = torch.load(f)
+            random.setstate(snapshot["rng_state"]["python"])
+            numpy.random.set_state(snapshot["rng_state"]["numpy"])
+            torch.random.set_rng_state(snapshot["rng_state"]["cpu"])
+            torch.cuda.random.set_rng_state(snapshot["rng_state"]["cuda"])
         
 
 def load_checkpoint(
