@@ -186,13 +186,14 @@ def main_worker(gpu, args):
         start_epoch = state.epoch + 1
         iters_to_skip = 0
     else:
-        start_epoch = state.epoch
+        start_epoch = max(state.epoch, 0)
         # Constaint: Prev world size and current world size are divisible, not explicitly enforcing however
         iters_to_skip = int(state.prev_batch_index * (state.prev_world_size / args.world_size)) + 1
 
     print(f"=> Starting from epoch: {start_epoch}, skipping iters={iters_to_skip}")
-    # Update GAS if necessary to ensure agg batch size is fixed
-    args.gradient_accumulation_steps *= (state.prev_world_size / args.world_size)
+    # Update GAS after restoring from a checkpoint
+    if state.epoch != -1:
+        args.gradient_accumulation_steps *= (state.prev_world_size / args.world_size)
     print(f"=> Using GAS = {args.gradient_accumulation_steps}")
     # Update state
     state.prev_world_size = args.world_size
@@ -208,7 +209,7 @@ def main_worker(gpu, args):
     
     optimizer.zero_grad()
 
-    state.load_rng_state(args.checkpoint_file)
+    load_rng_state(str(args.rank))
 
     for epoch in range(start_epoch, args.epochs):
         if args.max_steps is not None and state.global_step >= args.max_steps:
@@ -234,6 +235,7 @@ def main_worker(gpu, args):
         state.best_acc1 = max(acc1, state.best_acc1)
 
         # Take an epoch level checkpoint as well
+        save_rng_state(str(args.rank))
         if args.gpu == 0:
             state.prev_batch_index = -1
             save_checkpoint(state, is_best, args.checkpoint_file)
@@ -263,7 +265,7 @@ def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip
             batch_time.update(time.time() - end)
             end = time.time()
             if iters_to_skip == 0:
-                state.load_rng_state(args.checkpoint_file)
+                load_rng_state(str(args.rank))
             continue
 
         step_taken = False
@@ -302,6 +304,7 @@ def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip
             progress.display(i + 1)
 
         if args.save_steps is not None and step_taken and state.global_step % args.save_steps == 0:
+            save_rng_state(str(args.rank))
             if args.gpu == 0:
                 state.prev_batch_index = i
                 save_checkpoint(state, False, args.checkpoint_file)
@@ -503,10 +506,6 @@ class State:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.lr_scheduler.state_dict(),
             "rng_state": {
-                "python": random.getstate(),
-                "numpy": numpy.random.get_state(),
-                "cpu": torch.random.get_rng_state(),
-                "cuda": torch.cuda.random.get_rng_state()
             }
         }
 
@@ -536,14 +535,25 @@ class State:
         self.snapshot = snapshot
         self.apply_snapshot(snapshot, device_id)
 
-    def load_rng_state(self, f):
-        if os.path.isfile(f):
-            # Rng state needs to be loaded onto the cpu, so we cant reuse the snapshot from before
-            snapshot = torch.load(f)
-            random.setstate(snapshot["rng_state"]["python"])
-            numpy.random.set_state(snapshot["rng_state"]["numpy"])
-            torch.random.set_rng_state(snapshot["rng_state"]["cpu"])
-            torch.cuda.random.set_rng_state(snapshot["rng_state"]["cuda"])
+
+def save_rng_state(rank : str):
+    torch.save({
+        "python": random.getstate(),
+        "numpy": numpy.random.get_state(),
+        "cpu": torch.random.get_rng_state(),
+        "cuda": torch.cuda.random.get_rng_state()
+    }, "/tmp/rng_state_rank" + rank + ".pth")
+
+
+def load_rng_state(rank : str):
+    file = "/tmp/rng_state_rank" + rank + ".pth"
+    if os.path.isfile(file):
+        # Rng state needs to be loaded onto the cpu, so we cant reuse the snapshot from before
+        rng_state = torch.load(file)
+        random.setstate(rng_state["python"])
+        numpy.random.set_state(rng_state["numpy"])
+        torch.random.set_rng_state(rng_state["cpu"])
+        torch.cuda.random.set_rng_state(rng_state["cuda"])
         
 
 def load_checkpoint(
