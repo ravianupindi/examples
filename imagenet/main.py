@@ -4,6 +4,7 @@ import os
 import random
 import shutil
 import time
+import sys
 from contextlib import contextmanager
 from datetime import timedelta
 import warnings
@@ -254,7 +255,7 @@ def main_worker(gpu, args):
         epoch_start_time = time.time()
         train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip, args)
         epoch_time = time.time() - epoch_start_time
-        print('Epoch: {epoch} took time: {:.3f} seconds'.format(epoch_time))
+        print('Epoch: {} took time: {:.3f} seconds'.format(epoch, epoch_time))
 
         if args.max_steps is not None and state.global_step >= args.max_steps:
             print(f"=> Finished processing {args.max_steps} iterations")

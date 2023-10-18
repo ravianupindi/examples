@@ -9,6 +9,7 @@ docker run \
     --name $1 \
     -it \
     --rm \
+    --ipc=host \
     -v /home/ravianupindi/examples:/workspace \
     -v /home/ravianupindi/imagenet_data:/dataset \
     -v /home/ravianupindi/checkpoints/:/checkpoints \
@@ -16,6 +17,7 @@ docker run \
     -v /etc/group:/etc/group:ro \
     -v /etc/passwd:/etc/passwd:ro \
     -v /etc/shadow:/etc/shadow:ro \
-    --memory=100g \
+    --memory=200g \
+    --oom-kill-disable \
     --shm-size=10g \
     $image bash
