@@ -51,6 +51,8 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
+parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+                    help='url used to set up distributed training')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -62,16 +64,35 @@ parser.add_argument('--dist-backend', default='nccl', type=str,
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
-parser.add_argument("--checkpoint-file", default="/tmp/checkpoint.pth.tar", type=str, help="checkpoint file path, to load and save to")
+parser.add_argument("--checkpoint-file", default="/checkpoints/checkpoint.pth.tar", type=str, help="checkpoint file path, to load and save to")
 parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="This gets overridden after an elastic scale up/down")
 parser.add_argument("--max-steps", type=int, default=None, help="Number of steps to run training for")
 parser.add_argument("--save-steps", type=int, default=None, help="Number of training steps to complete before taking a checkpoint")
+parser.add_argument('--training_output_file', default=None, type=str)
+parser.add_argument('--singularity-launch', action='store_true', help='Use singularity for distributed launch')
 
 best_acc1 = 0
 
 
+def set_log_redirection(training_output_file):
+    original_stdout = sys.stdout
+    training_output_file_handle = open(training_output_file, 'a+')
+    sys.stdout = training_output_file_handle
+    return training_output_file_handle, original_stdout
+
+
+def reset_log_redirection(training_output_file_handle, original_stdout):
+    training_output_file_handle.close()
+    sys.stdout = original_stdout
+
+
 def main():
     args = parser.parse_args()
+
+    if args.training_output_file:
+        args.training_output_file=args.training_output_file
+        training_output_file_handle, original_stdout = set_log_redirection(args.training_output_file)
+
     args.gpu = int(os.environ["LOCAL_RANK"])
     args.world_size = int(os.environ['WORLD_SIZE'])
     args.rank = int(os.environ['RANK'])
@@ -96,12 +117,21 @@ def main():
 
     main_worker(args.gpu, args)
 
+    if args.training_output_file:
+        reset_log_redirection(training_output_file_handle, original_stdout)
+
 
 def main_worker(gpu, args):
     args.gpu = gpu
-    dist.init_process_group(
-        backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=10)
-    )
+
+    if args.singularity_launch:
+        print("Launching distributed training with backend: {}, world size: {} rank: {}".format(args.dist_backend, args.world_size, args.rank), flush=True)
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+    else:
+        dist.init_process_group(
+            backend=args.dist_backend, init_method="env://", timeout=timedelta(seconds=10)
+        )
 
     # create model
     if args.pretrained:
@@ -178,9 +208,12 @@ def main_worker(gpu, args):
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
     # Resume from checkpoint if available
-    state = load_checkpoint(
-        args.checkpoint_file, args.gpu, args.arch, model, optimizer, scheduler
-    )
+    if not args.singularity_launch:
+        state = load_checkpoint(
+            args.checkpoint_file, args.gpu, args.arch, model, optimizer, scheduler
+        )
+    else:
+        state = State(arch, model, optimizer, scheduler)
 
     if state.prev_batch_index == -1:
         start_epoch = state.epoch + 1
@@ -192,11 +225,12 @@ def main_worker(gpu, args):
 
     print(f"=> Starting from epoch: {start_epoch}, skipping iters={iters_to_skip}")
     # Update GAS after restoring from a checkpoint
-    if state.epoch != -1:
-        args.gradient_accumulation_steps *= (state.prev_world_size / args.world_size)
-    print(f"=> Using GAS = {args.gradient_accumulation_steps}")
-    # Update state
+    if state.gas != -1:
+        args.gradient_accumulation_steps = state.gas * (state.prev_world_size / args.world_size)
+    
     state.prev_world_size = args.world_size
+    state.gas = args.gradient_accumulation_steps
+    print(f"=> Using GAS = {args.gradient_accumulation_steps}")
 
     if args.evaluate:
         validate(val_loader, model, criterion, args)
@@ -209,18 +243,20 @@ def main_worker(gpu, args):
     
     optimizer.zero_grad()
 
-    load_rng_state(str(args.rank))
+    if not args.singularity_launch:
+        load_rng_state(str(args.rank))
 
-    for epoch in range(start_epoch, args.epochs):
-        if args.max_steps is not None and state.global_step >= args.max_steps:
-            print(f"=> Finished processing {args.max_steps} iterations")
-            break
-        
+    for epoch in range(start_epoch, args.epochs): 
         state.epoch = epoch
         train_sampler.set_epoch(epoch)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip, args)
+
+        if args.max_steps is not None and state.global_step >= args.max_steps:
+            print(f"=> Finished processing {args.max_steps} iterations")
+            print(f"Exiting training loop", flush=True)
+            break
 
         if epoch == start_epoch:
             iters_to_skip = 0
@@ -235,10 +271,11 @@ def main_worker(gpu, args):
         state.best_acc1 = max(acc1, state.best_acc1)
 
         # Take an epoch level checkpoint as well
-        save_rng_state(str(args.rank))
-        if args.gpu == 0:
-            state.prev_batch_index = -1
-            save_checkpoint(state, is_best, args.checkpoint_file)
+        if not args.singularity_launch:
+            save_rng_state(str(args.rank))
+            if args.gpu == 0:
+                state.prev_batch_index = -1
+                save_checkpoint(state, is_best, args.checkpoint_file)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip, args):
@@ -265,7 +302,8 @@ def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip
             batch_time.update(time.time() - end)
             end = time.time()
             if iters_to_skip == 0:
-                load_rng_state(str(args.rank))
+                if not args.singularity_launch:
+                    load_rng_state(str(args.rank))
             continue
 
         step_taken = False
@@ -277,15 +315,14 @@ def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip
         output = model(images)
         loss = criterion(output, target)
 
+        del images
         loss = loss / args.gradient_accumulation_steps
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        # If we want accurate top1 top5 reporting after restore
-        # of iteration level checkpoint, we need to freeze these objects as well
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        # acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        # losses.update(loss.item(), images.size(0))
+        # top1.update(acc1[0], images.size(0))
+        # top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         loss.backward()
@@ -296,18 +333,24 @@ def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip
             state.global_step += 1
             step_taken = True
 
+        train_loss = loss.item()
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0:
-            progress.display(i + 1)
+            # progress.display(i + 1)
+            print('Rank: {} | Batch: [{}/{}] | Loss: {:.16f} | Accuracy: {:.16f} | Batch time: {:.3f} s'.format(
+                args.rank, i + 1, len(train_loader), train_loss, acc1[0], batch_time.getvalue()))
 
-        if args.save_steps is not None and step_taken and state.global_step % args.save_steps == 0:
-            save_rng_state(str(args.rank))
-            if args.gpu == 0:
-                state.prev_batch_index = i
-                save_checkpoint(state, False, args.checkpoint_file)
+        if not args.singularity_launch:
+            if args.save_steps is not None and step_taken and state.global_step % args.save_steps == 0:
+                save_rng_state(str(args.rank))
+                if args.gpu == 0:
+                    state.prev_batch_index = i
+                    save_checkpoint(state, False, args.checkpoint_file)
 
         if args.max_steps is not None and state.global_step == args.max_steps:
             break
@@ -390,12 +433,17 @@ class AverageMeter(object):
         self.avg = 0
         self.sum = 0
         self.count = 0
+        self.avg_count = 0
 
     def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
         self.count += n
-        self.avg = self.sum / self.count
+        self.val = val
+        if self.count < 10:
+            return
+
+        self.avg_count += n
+        self.sum += val * n
+        self.avg = self.sum / self.avg_count
 
     def all_reduce(self):
         if torch.cuda.is_available():
@@ -427,6 +475,9 @@ class AverageMeter(object):
             raise ValueError('invalid summary type %r' % self.summary_type)
         
         return fmtstr.format(**self.__dict__)
+    
+    def getvalue(self):
+        return self.avg
 
 
 class ProgressMeter(object):
@@ -478,6 +529,7 @@ class State:
         self.global_step = 0
         self.prev_world_size = 1
         self.prev_batch_index = -1
+        self.gas = -1
         self.best_acc1 = 0
         self.arch = arch
         self.model = model
@@ -500,6 +552,7 @@ class State:
             "global_step": self.global_step,
             "prev_world_size": self.prev_world_size,
             "prev_batch_index": self.prev_batch_index,
+            "gas": self.gas,
             "best_acc1": self.best_acc1,
             "arch": self.arch,
             "state_dict": self.model.state_dict(),
@@ -520,6 +573,7 @@ class State:
         self.global_step = obj["global_step"]
         self.prev_world_size = obj["prev_world_size"]
         self.prev_batch_index = obj["prev_batch_index"]
+        self.gas = obj["gas"]
         self.best_acc1 = obj["best_acc1"]
         self.state_dict = obj["state_dict"]
         self.model.load_state_dict(obj["state_dict"])
@@ -542,11 +596,11 @@ def save_rng_state(rank : str):
         "numpy": numpy.random.get_state(),
         "cpu": torch.random.get_rng_state(),
         "cuda": torch.cuda.random.get_rng_state()
-    }, "/tmp/rng_state_rank" + rank + ".pth")
+    }, "/checkpoints/rng_state_rank" + rank + ".pth")
 
 
 def load_rng_state(rank : str):
-    file = "/tmp/rng_state_rank" + rank + ".pth"
+    file = "/checkpoints/rng_state_rank" + rank + ".pth"
     if os.path.isfile(file):
         # Rng state needs to be loaded onto the cpu, so we cant reuse the snapshot from before
         rng_state = torch.load(file)
