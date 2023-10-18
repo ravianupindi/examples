@@ -251,7 +251,10 @@ def main_worker(gpu, args):
         train_sampler.set_epoch(epoch)
 
         # train for one epoch
+        epoch_start_time = time.time()
         train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip, args)
+        epoch_time = time.time() - epoch_start_time
+        print('Epoch: {epoch} took time: {:.3f} seconds'.format(epoch_time))
 
         if args.max_steps is not None and state.global_step >= args.max_steps:
             print(f"=> Finished processing {args.max_steps} iterations")

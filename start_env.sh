@@ -8,7 +8,6 @@ docker run \
     --gpus all \
     --name $1 \
     -it \
-    --ipc=host \
     --rm \
     -v /home/ravianupindi/examples:/workspace \
     -v /home/ravianupindi/imagenet_data:/dataset \
