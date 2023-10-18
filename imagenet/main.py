@@ -273,7 +273,7 @@ def main_worker(gpu, args):
         # Take an epoch level checkpoint as well
         if not args.singularity_launch:
             save_rng_state(str(args.rank))
-            if args.gpu == 0:
+            if args.rank == 0:
                 state.prev_batch_index = -1
                 save_checkpoint(state, is_best, args.checkpoint_file)
 
@@ -348,7 +348,7 @@ def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip
         if not args.singularity_launch:
             if args.save_steps is not None and step_taken and state.global_step % args.save_steps == 0:
                 save_rng_state(str(args.rank))
-                if args.gpu == 0:
+                if args.rank == 0:
                     state.prev_batch_index = i
                     save_checkpoint(state, False, args.checkpoint_file)
 
