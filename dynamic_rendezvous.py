@@ -120,8 +120,8 @@ class RendezvousTimeout:
     _ZERO = timedelta(0)
 
     _DEFAULT_TIMEOUTS = {
-        "join": timedelta(seconds=600),
-        "last_call": timedelta(seconds=30),
+        "join": timedelta(seconds=60), # Ravi
+        "last_call": timedelta(seconds=10), # Ravi
         "close": timedelta(seconds=30),
         "heartbeat": timedelta(seconds=5),
     }
@@ -735,7 +735,7 @@ class _RendezvousJoinOp:
 
         now = time.monotonic()
         if now > deadline:
-            rollback_period = 5  # 5 seconds
+            rollback_period = 60  # 5 seconds # Ravi
 
             # If we still have time to rollback (a short period on top of the
             # operation deadline), try to remove ourself from the rendezvous.
@@ -756,9 +756,14 @@ class _RendezvousJoinOp:
             # If we are here, it means we are not part of the rendezvous. In
             # case the rendezvous has capacity for additional participants add
             # ourself to the wait list for the next round.
+            if not state.participants: # Ravi
+                state.complete = False
+                state.round += 1
+
             if len(state.participants) < ctx.settings.max_nodes:
                 if ctx.node not in state.wait_list:
                     return _Action.ADD_TO_WAIT_LIST
+
         elif is_participant:
             # If the rendezvous has enough number of participants including us,
             # check whether we have passed the rendezvous deadline. If yes,
@@ -985,7 +990,6 @@ class DynamicRendezvousHandler(RendezvousHandler):
             return False
 
     def _close(self) -> None:
-        return # Ravi, early return here
         op = _RendezvousCloseOp()
 
         deadline = self._get_deadline(self._settings.timeout.close)

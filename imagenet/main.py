@@ -222,7 +222,7 @@ def main_worker(gpu, args):
     else:
         start_epoch = max(state.epoch, 0)
         # Constaint: Prev world size and current world size are divisible, not explicitly enforcing however
-        iters_to_skip = int(state.prev_batch_index * (state.prev_world_size / args.world_size)) + 1
+        iters_to_skip = int((state.prev_batch_index + 1) * (state.prev_world_size / args.world_size))
 
     print(f"=> Starting from epoch: {start_epoch}, skipping iters={iters_to_skip}")
     # Update GAS after restoring from a checkpoint
@@ -320,7 +320,8 @@ def train(train_loader, model, criterion, optimizer, epoch, state, iters_to_skip
         loss = criterion(output, target)
 
         del images
-        loss = loss / args.gradient_accumulation_steps
+        if args.gradient_accumulation_steps > 1:
+            loss = loss / args.gradient_accumulation_steps
 
         # measure accuracy and record loss
         # acc1, acc5 = accuracy(output, target, topk=(1, 5))

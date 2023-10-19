@@ -10,6 +10,7 @@ docker run \
     -it \
     --rm \
     --ipc=host \
+    --net elastic \
     -v /home/ravianupindi/examples:/workspace \
     -v /home/ravianupindi/imagenet_data:/dataset \
     -v /home/ravianupindi/checkpoints/:/checkpoints \
